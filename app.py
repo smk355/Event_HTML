@@ -1,110 +1,127 @@
-# app.py
-from flask import Flask, render_template, request, redirect, url_for, flash, session
-from flask_sqlalchemy import SQLAlchemy
-from werkzeug.security import generate_password_hash, check_password_hash
-import re
+from flask import Flask, request, jsonify, render_template, redirect, url_for, session
+from pymongo.mongo_client import MongoClient
+from pymongo.server_api import ServerApi
 from datetime import datetime
+from bson import ObjectId
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'c7cbecd5248e0a912ea1b218eaec6574b83aec62ff2126b1'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root2:abcd1234@localhost/eventease'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.secret_key = 'your-secret-key-here'  # Required for sessions
 
-db = SQLAlchemy(app)
+# MongoDB connection
+uri = "mongodb+srv://smitkothari2023:BX492rFPjCPLkVXg@eventease.mf080.mongodb.net/?retryWrites=true&w=majority&appName=EventEase"
+client = MongoClient(uri, server_api=ServerApi('1'))
+db = client['EventEaseDB']
+events_collection = db['events']
+clubs_collection = db['clubs']
+users_collection = db['users']
+rsvp_collection = db['rsvp']
 
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(100), nullable=False)
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    password = db.Column(db.String(255), nullable=False)
-
-class Event(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(100), nullable=False)
-    description = db.Column(db.Text, nullable=False)
-    date = db.Column(db.DateTime, nullable=False)
-    location = db.Column(db.String(100), nullable=False)
-    organizer = db.Column(db.String(100), nullable=False)
-
-@app.route('/')
-def home():
-    return render_template('home.html')
-
+# Authentication routes
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        user = User.query.filter_by(username=username).first()
-        if user and check_password_hash(user.password, password):
-            session['user_id'] = user.id
-            flash('Logged in successfully!', 'success')
-            return redirect(url_for('events'))
-        else:
-            flash('Invalid username or password', 'error')
-        
+        user_data = request.form
+        user = users_collection.find_one({
+            'email': user_data['email'],
+            'password': user_data['password']  # For production, use proper password hashing
+        })
+        if user:
+            session['user_id'] = str(user['_id'])
+            session['user_type'] = user['user_type']  # 'student' or 'club'
+            return redirect(url_for('home'))
+        return render_template('login.html', message="Invalid credentials")
     return render_template('login.html')
 
-@app.route('/signup', methods=['GET', 'POST'])
-def signup():
+@app.route('/register', methods=['GET', 'POST'])
+def register():
     if request.method == 'POST':
-        name = request.form['name']
-        email = request.form['email']
-        username = request.form['username']
-        password = request.form['password']
+        user_data = {
+            'email': request.form['email'],
+            'password': request.form['password'],
+            'user_type': request.form['user_type']
+        }
+        if users_collection.find_one({'email': user_data['email']}):
+            return render_template('register.html', message="Email already registered")
 
-        if not re.match(r'.*@(vitstudent\.ac\.in|vit\.ac\.in)$', email):
-            flash('Invalid email domain. Please use a VIT email address.', 'error')
-            return render_template('login.html')
+        # Ensure user_type is valid ('student' or 'club')
+        if user_data['user_type'] not in ['student', 'club']:
+            return render_template('register.html', message="Invalid user type")
 
-        if User.query.filter((User.username == username) | (User.email == email)).first():
-            flash('Username or email already exists', 'error')
-            return render_template('login.html')
-
-        hashed_password = generate_password_hash(password)
-        new_user = User(name=name, email=email, username=username, password=hashed_password)
-        db.session.add(new_user)
-        db.session.commit()
-
-        flash('Account created successfully! Please log in.', 'success')
+        users_collection.insert_one(user_data)
         return redirect(url_for('login'))
-
-    return render_template('login.html')
+    return render_template('register.html')
 
 @app.route('/logout')
 def logout():
-    session.pop('user_id', None)
-    return redirect(url_for('home'))
+    session.clear()
+    return redirect(url_for('login'))
 
-@app.route('/events')
-def events():
+# Home route
+@app.route('/')
+def home():
     if 'user_id' not in session:
         return redirect(url_for('login'))
-    events = Event.query.order_by(Event.date).all()
-    return render_template('events.html', events=events)
 
+    if 'user_type' not in session:
+        return redirect(url_for('login'))
+
+    # Display different events based on user type
+    events = None
+    if session['user_type'] == 'student':
+        events = list(events_collection.find({
+            'date': {'$gte': datetime.now().strftime('%Y-%m-%d')}
+        }))
+    elif session['user_type'] == 'club':
+        events = list(events_collection.find({'created_by': session['user_id']}))
+    
+    return render_template('event.html', events=events)
+
+# Event details route
+@app.route('/event/<event_id>', methods=['GET', 'POST'])
+def event_details(event_id):
+    if 'user_id' not in session:
+        return redirect(url_for('login'))
+
+    event = events_collection.find_one({'_id': ObjectId(event_id)})
+    if not event:
+        return "Event not found", 404
+
+    if session['user_type'] == 'student':
+        if request.method == 'POST':
+            rsvp_data = {
+                'event_id': event_id,
+                'student_id': session['user_id'],
+                'name': request.form['name'],
+                'email': request.form['email'],
+                'mobile': request.form['mobile'],
+                'timestamp': datetime.now()
+            }
+            rsvp_collection.insert_one(rsvp_data)
+            return render_template('event_details.html', event=event, message="RSVP successful!")
+        return render_template('event_details.html', event=event)
+    elif session['user_type'] == 'club':
+        participants = list(rsvp_collection.find({'event_id': event_id}))
+        return render_template('event_participants.html', event=event, participants=participants)
+
+# Create new event (only for clubs)
 @app.route('/create_event', methods=['GET', 'POST'])
 def create_event():
-    if 'user_id' not in session:
+    if 'user_id' not in session or session['user_type'] != 'club':
         return redirect(url_for('login'))
+
     if request.method == 'POST':
-        title = request.form['title']
-        description = request.form['description']
-        date = datetime.strptime(request.form['date'], '%Y-%m-%d')
-        location = request.form['location']
-        organizer = request.form['organizer']
-        
-        new_event = Event(title=title, description=description, date=date, location=location, organizer=organizer)
-        db.session.add(new_event)
-        db.session.commit()
-        
-        flash('Event created successfully!', 'success')
-        return redirect(url_for('events'))
-    
-    return render_template('create_event.html')
+        event_data = {
+            'title': request.form['title'],
+            'description': request.form['description'],
+            'date': request.form['date'],
+            'location': request.form['location'],
+            'created_by': session['user_id'],
+            'created_at': datetime.now()
+        }
+        events_collection.insert_one(event_data)
+        return redirect(url_for('home'))
+
+    return render_template('createevent.html')
 
 if __name__ == '__main__':
-    with app.app_context():
-        db.create_all()
     app.run(debug=True)
